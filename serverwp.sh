@@ -9,6 +9,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS_FILE="${SCRIPT_DIR}/serverwp.defaults.sh"
 [[ -f "${DEFAULTS_FILE}" ]] && . "${DEFAULTS_FILE}"
 
+COMMAND="${1:-install}"
+WP_CLI="${WP_CLI:-/usr/local/bin/wp}"
+
 
 RED=$'[0;31m'
 GREEN=$'[0;32m'
@@ -37,6 +40,24 @@ require_root() {
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+usage() {
+  cat <<EOF
+Usage: $0 [install|add-site]
+
+Commands:
+  install    Prepare a fresh server and install the first WordPress site.
+  add-site   Add another isolated WordPress site to an existing serverwp server.
+EOF
+}
+
+validate_command() {
+  case "${COMMAND}" in
+    install|add-site) ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage; die "Unknown command: ${COMMAND}" ;;
+  esac
 }
 
 prompt_nonempty() {
@@ -165,6 +186,44 @@ prompt_ipv4_default() {
   done
 }
 
+sanitize_identifier() {
+  local prefix="$1"
+  local value="$2"
+  local max_len="$3"
+  local clean=""
+  clean="$(printf '%s' "${value,,}" | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//')"
+  [[ -n "${clean}" ]] || clean="site"
+  local result="${prefix}${clean}"
+  if (( ${#result} > max_len )); then
+    local checksum=""
+    checksum="$(printf '%s' "${value}" | cksum | awk '{print $1}')"
+    local keep=$(( max_len - ${#prefix} - ${#checksum} - 1 ))
+    (( keep < 1 )) && keep=1
+    result="${prefix}${clean:0:keep}_${checksum}"
+  fi
+  printf '%s' "${result}"
+}
+
+set_site_paths() {
+  SITE_ROOT="${DOCROOT_BASE}/${SITE_DOMAIN}"
+  WEB_ROOT="${SITE_ROOT}"
+  APACHE_SITE_CONF="${APACHE_CONF_DIR}/${SITE_DOMAIN}.conf"
+  SITE_USER="$(sanitize_identifier "wp_" "${SITE_DOMAIN}" 32)"
+  SITE_GROUP="${SITE_USER}"
+  PHP_FPM_POOL_NAME="${SITE_USER}"
+  PHP_FPM_SOCKET="${PHP_FPM_SOCKET_DIR}/${SITE_USER}.sock"
+  if [[ -n "${PHP_FPM_POOL_DIR:-}" ]]; then
+    PHP_FPM_POOL_CONF="${PHP_FPM_POOL_DIR}/${PHP_FPM_POOL_NAME}.conf"
+  else
+    PHP_FPM_POOL_CONF=""
+  fi
+}
+
+set_db_defaults_for_domain() {
+  DEFAULT_GENERATED_DB_NAME="$(sanitize_identifier "wp_" "${SITE_DOMAIN}" 64)"
+  DEFAULT_GENERATED_DB_USER="$(sanitize_identifier "wp_" "${SITE_DOMAIN}" 32)"
+}
+
 run_step() {
   local description="$1"
   shift
@@ -192,6 +251,10 @@ detect_os() {
       DB_SERVICE="mariadb"
       FIREWALL_KIND="firewalld"
       BIND_SERVICE="named"
+      PHP_FPM_PACKAGE="php-fpm"
+      PHP_FPM_SERVICE="php-fpm"
+      PHP_FPM_POOL_DIR="/etc/php-fpm.d"
+      PHP_FPM_SOCKET_DIR="/run/php-fpm"
       ;;
     ubuntu)
       [[ "${OS_VERSION_MAJOR}" == "22" || "${OS_VERSION_MAJOR}" == "24" ]] || die "This script supports Ubuntu 22.04 or 24.04."
@@ -204,6 +267,8 @@ detect_os() {
       DB_SERVICE="mariadb"
       FIREWALL_KIND="ufw"
       BIND_SERVICE="bind9"
+      PHP_FPM_PACKAGE="php-fpm"
+      PHP_FPM_SOCKET_DIR="/run/php"
       ;;
 debian)
   [[ "${OS_VERSION_MAJOR}" == "12" || "${OS_VERSION_MAJOR}" == "13" ]] || die "This script supports Debian 12 or 13."
@@ -216,6 +281,8 @@ debian)
   DB_SERVICE="mariadb"
   FIREWALL_KIND="ufw"
   BIND_SERVICE="bind9"
+  PHP_FPM_PACKAGE="php-fpm"
+  PHP_FPM_SOCKET_DIR="/run/php"
   ;;
     *)
       die "Unsupported OS. Use AlmaLinux 9, Ubuntu 22.04/24.04, or Debian 12/13."
@@ -238,16 +305,29 @@ show_intro() {
   echo -e "${GREEN}====================================================${NC}"
   echo -e "${GREEN}Welcome to serverwp v${SCRIPT_VERSION}${NC}"
   echo -e "${GREEN}====================================================${NC}"
-  echo -e "${BLUE}This installer will prepare a fresh Linux server to host WordPress.${NC}"
+  if [[ "${COMMAND}" == "add-site" ]]; then
+    echo -e "${BLUE}This mode adds another isolated WordPress site to an existing serverwp server.${NC}"
+  else
+    echo -e "${BLUE}This installer will prepare a fresh Linux server to host WordPress.${NC}"
+  fi
   echo
-  echo -e "${YELLOW}It will install and configure:${NC}"
-  echo -e "  - Apache web server"
-  echo -e "  - PHP with essential WordPress modules"
-  echo -e "  - MariaDB database server"
-  echo -e "  - WP-CLI"
-  echo -e "  - The latest version of WordPress"
-  echo -e "  - UpdraftPlus backup plugin"
-  echo -e "  - Optional Cloudflare guidance, BIND DNS, firewall, and Let's Encrypt SSL"
+  if [[ "${COMMAND}" == "add-site" ]]; then
+    echo -e "${YELLOW}It will configure:${NC}"
+    echo -e "  - A dedicated Linux user for the new site"
+    echo -e "  - A dedicated PHP-FPM pool and socket"
+    echo -e "  - A separate MariaDB database and database user"
+    echo -e "  - A separate Apache virtual host"
+    echo -e "  - WordPress, UpdraftPlus, and optional Let's Encrypt SSL"
+  else
+    echo -e "${YELLOW}It will install and configure:${NC}"
+    echo -e "  - Apache web server"
+    echo -e "  - PHP-FPM with essential WordPress modules"
+    echo -e "  - MariaDB database server"
+    echo -e "  - WP-CLI"
+    echo -e "  - The latest version of WordPress"
+    echo -e "  - UpdraftPlus backup plugin"
+    echo -e "  - Optional Cloudflare guidance, BIND DNS, firewall, and Let's Encrypt SSL"
+  fi
   echo
   echo -e "${BLUE}Supported systems:${NC} AlmaLinux 9, Ubuntu 22.04/24.04, Debian 12/13"
   echo -e "${GREEN}====================================================${NC}"
@@ -366,9 +446,7 @@ collect_answers() {
   prompt_yes_no CONFIGURE_FIREWALL "Configure firewall automatically?"
   prompt_yes_no FORCE_HTTPS "Redirect HTTP to HTTPS after certificate is installed?"
 
-  SITE_ROOT="${DOCROOT_BASE}/${SITE_DOMAIN}"
-  WEB_ROOT="${SITE_ROOT}"
-  APACHE_SITE_CONF="${APACHE_CONF_DIR}/${SITE_DOMAIN}.conf"
+  set_site_paths
 
   echo
   echo "================= SUMMARY ================="
@@ -454,15 +532,18 @@ install_apache_php_alma() {
   dnf -y install https://rpms.remirepo.net/enterprise/remi-release-9.rpm
   dnf -y module reset php
   dnf -y module install "php:remi-${PHP_VERSION}"
-  dnf -y install httpd php php-cli php-common php-mysqlnd php-gd php-mbstring php-xml php-curl php-zip php-intl php-soap php-bcmath php-opcache php-pecl-imagick mod_ssl
+  dnf -y install httpd php php-cli php-common php-mysqlnd php-gd php-mbstring php-xml php-curl php-zip php-intl php-soap php-bcmath php-opcache php-pecl-imagick mod_ssl php-fpm
   systemctl enable --now httpd
+  systemctl enable --now php-fpm
 }
 
 install_apache_php_deb() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y apache2 php php-cli php-common php-mysql php-gd php-mbstring php-xml php-curl php-zip php-intl php-soap php-bcmath libapache2-mod-php
-  a2enmod rewrite headers ssl >/dev/null 2>&1 || true
+  apt-get install -y apache2 php php-fpm php-cli php-common php-mysql php-gd php-mbstring php-xml php-curl php-zip php-intl php-soap php-bcmath
+  a2enmod rewrite headers ssl proxy_fcgi setenvif >/dev/null 2>&1 || true
   systemctl enable --now apache2
+  detect_php_fpm_runtime || die "Could not detect PHP-FPM runtime after installing PHP-FPM."
+  systemctl enable --now "${PHP_FPM_SERVICE}"
 }
 
 install_apache_php() {
@@ -490,6 +571,116 @@ tune_php() {
 
   systemctl restart php-fpm >/dev/null 2>&1 || true
   systemctl restart "${APACHE_SERVICE}" >/dev/null 2>&1 || true
+}
+
+
+detect_php_fpm_runtime() {
+  if [[ "${OS_ID}" == "almalinux" ]]; then
+    PHP_FPM_SERVICE="${PHP_FPM_SERVICE:-php-fpm}"
+    PHP_FPM_POOL_DIR="${PHP_FPM_POOL_DIR:-/etc/php-fpm.d}"
+    PHP_FPM_SOCKET_DIR="${PHP_FPM_SOCKET_DIR:-/run/php-fpm}"
+    return 0
+  fi
+
+  local version=""
+  version="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  if [[ -z "${version}" ]]; then
+    version="$(php -v 2>/dev/null | awk 'NR==1 {split($2,a,"."); print a[1]"."a[2]}')"
+  fi
+  [[ -n "${version}" ]] || return 1
+  PHP_FPM_VERSION="${version}"
+  PHP_FPM_SERVICE="php${PHP_FPM_VERSION}-fpm"
+  PHP_FPM_POOL_DIR="/etc/php/${PHP_FPM_VERSION}/fpm/pool.d"
+  PHP_FPM_SOCKET_DIR="/run/php"
+}
+
+php_fpm_available() {
+  detect_php_fpm_runtime || return 1
+  [[ -d "${PHP_FPM_POOL_DIR}" ]] && systemctl list-unit-files "${PHP_FPM_SERVICE}.service" >/dev/null 2>&1
+}
+
+site_uses_php_fpm() {
+  local conf="${1:-${APACHE_SITE_CONF:-}}"
+  [[ -n "${conf}" && -f "${conf}" ]] || return 1
+  grep -Eq 'proxy:unix:|SetHandler "proxy:' "${conf}"
+}
+
+ensure_php_fpm_stack() {
+  if php_fpm_available; then
+    return 0
+  fi
+
+  log "Installing PHP-FPM support..."
+  case "${OS_ID}" in
+    almalinux)
+      dnf -y install php-fpm
+      systemctl enable --now php-fpm
+      ;;
+    ubuntu|debian)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y php-fpm
+      a2enmod proxy_fcgi setenvif rewrite headers ssl >/dev/null 2>&1 || true
+      detect_php_fpm_runtime || die "Could not detect PHP-FPM runtime after installing PHP-FPM."
+      systemctl enable --now "${PHP_FPM_SERVICE}"
+      ;;
+  esac
+}
+
+disable_mod_php_if_present() {
+  [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "debian" ]] || return 0
+  local mod=""
+  for mod in /etc/apache2/mods-enabled/php*.load; do
+    [[ -e "${mod}" ]] || continue
+    a2dismod "$(basename "${mod}" .load)" >/dev/null 2>&1 || true
+  done
+}
+
+create_site_user() {
+  if id "${SITE_USER}" >/dev/null 2>&1; then
+    return 0
+  fi
+  useradd --system --user-group --home-dir "${SITE_ROOT}" --shell /usr/sbin/nologin "${SITE_USER}"
+}
+
+write_php_fpm_pool() {
+  mkdir -p "${PHP_FPM_POOL_DIR}" "${PHP_FPM_SOCKET_DIR}"
+  cat > "${PHP_FPM_POOL_CONF}" <<EOF
+[${PHP_FPM_POOL_NAME}]
+user = ${SITE_USER}
+group = ${SITE_GROUP}
+listen = ${PHP_FPM_SOCKET}
+listen.owner = ${APACHE_USER}
+listen.group = ${APACHE_GROUP}
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 20s
+pm.max_requests = 500
+php_admin_value[open_basedir] = ${WEB_ROOT}:/tmp
+php_admin_value[upload_tmp_dir] = /tmp
+php_admin_value[session.save_path] = /tmp
+php_admin_flag[log_errors] = on
+EOF
+}
+
+restart_php_fpm_checked() {
+  detect_php_fpm_runtime || die "Could not detect PHP-FPM runtime."
+  if [[ "${OS_ID}" == "almalinux" ]]; then
+    php-fpm -t
+  else
+    php-fpm"${PHP_FPM_VERSION}" -t
+  fi
+  systemctl restart "${PHP_FPM_SERVICE}"
+}
+
+configure_php_fpm_site() {
+  ensure_php_fpm_stack
+  set_site_paths
+  create_site_user
+  write_php_fpm_pool
+  disable_mod_php_if_present
+  restart_php_fpm_checked
 }
 
 install_mariadb_alma() {
@@ -525,24 +716,37 @@ SQL
 }
 
 install_wp_cli() {
-  curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-  chmod +x /usr/local/bin/wp
-  wp --info --allow-root >/dev/null
+  curl -fsSL -o "${WP_CLI}" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+  chmod +x "${WP_CLI}"
+  "${WP_CLI}" --info --allow-root >/dev/null
+}
+
+ensure_wp_cli() {
+  if [[ -x "${WP_CLI}" ]]; then
+    "${WP_CLI}" --info --allow-root >/dev/null
+    return 0
+  fi
+  if have_cmd wp; then
+    WP_CLI="$(command -v wp)"
+    "${WP_CLI}" --info --allow-root >/dev/null
+    return 0
+  fi
+  install_wp_cli
 }
 
 install_wordpress() {
   mkdir -p "${WEB_ROOT}"
-  wp core download --path="${WEB_ROOT}" --allow-root
-  wp config create     --path="${WEB_ROOT}"     --dbname="${DB_NAME}"     --dbuser="${DB_USER}"     --dbpass="${DB_PASS}"     --dbhost="localhost"     --dbcharset="utf8mb4"     --dbprefix="wp_"     --skip-check     --allow-root
-  wp core install     --path="${WEB_ROOT}"     --url="http://${SITE_DOMAIN}"     --title="${SITE_TITLE}"     --admin_user="${ADMIN_USER}"     --admin_password="${ADMIN_PASS}"     --admin_email="${ADMIN_EMAIL}"     --skip-email     --allow-root
-  chown -R "${APACHE_USER}:${APACHE_GROUP}" "${SITE_ROOT}"
+  "${WP_CLI}" core download --path="${WEB_ROOT}" --allow-root
+  "${WP_CLI}" config create     --path="${WEB_ROOT}"     --dbname="${DB_NAME}"     --dbuser="${DB_USER}"     --dbpass="${DB_PASS}"     --dbhost="localhost"     --dbcharset="utf8mb4"     --dbprefix="wp_"     --skip-check     --allow-root
+  "${WP_CLI}" core install     --path="${WEB_ROOT}"     --url="http://${SITE_DOMAIN}"     --title="${SITE_TITLE}"     --admin_user="${ADMIN_USER}"     --admin_password="${ADMIN_PASS}"     --admin_email="${ADMIN_EMAIL}"     --skip-email     --allow-root
+  chown -R "${SITE_USER}:${SITE_GROUP}" "${SITE_ROOT}"
   find "${SITE_ROOT}" -type d -exec chmod 755 {} \;
   find "${SITE_ROOT}" -type f -exec chmod 644 {} \;
 }
 
 
 install_updraftplus() {
-  wp plugin install updraftplus --activate --path="${WEB_ROOT}" --allow-root
+  "${WP_CLI}" plugin install updraftplus --activate --path="${WEB_ROOT}" --allow-root
 }
 
 
@@ -555,7 +759,7 @@ set_wordpress_permissions() {
   mkdir -p "${WEB_ROOT}/wp-content/plugins"
   mkdir -p "${WEB_ROOT}/wp-content/themes"
 
-  chown -R "${APACHE_USER}:${APACHE_GROUP}" "${SITE_ROOT}"
+  chown -R "${SITE_USER}:${SITE_GROUP}" "${SITE_ROOT}"
 
   find "${SITE_ROOT}" -type d -exec chmod 755 {} \;
   find "${SITE_ROOT}" -type f -exec chmod 644 {} \;
@@ -616,6 +820,10 @@ EOF
         Options FollowSymLinks
     </Directory>
 
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:${PHP_FPM_SOCKET}|fcgi://localhost/"
+    </FilesMatch>
+
     ErrorLog ${APACHE_LOG_DIR}/${SITE_DOMAIN}-error.log
     CustomLog ${APACHE_LOG_DIR}/${SITE_DOMAIN}-access.log combined
 </VirtualHost>
@@ -642,6 +850,10 @@ EOF
         DirectoryIndex index.php index.html
         Options FollowSymLinks
     </Directory>
+
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:${PHP_FPM_SOCKET}|fcgi://localhost/"
+    </FilesMatch>
 
     ErrorLog ${APACHE_LOG_DIR}/${SITE_DOMAIN}-error.log
     CustomLog ${APACHE_LOG_DIR}/${SITE_DOMAIN}-access.log combined
@@ -692,7 +904,9 @@ restart_apache_checked() {
 }
 
 configure_apache_vhost() {
-  disable_default_apache_configs
+  if [[ "${COMMAND}" == "install" ]]; then
+    disable_default_apache_configs
+  fi
   case "${OS_ID}" in
     almalinux) write_apache_vhost_alma ;;
     ubuntu|debian) write_apache_vhost_deb ;;
@@ -861,21 +1075,34 @@ public_dns_points_here() {
 }
 
 install_certbot_any() {
+  if have_cmd certbot; then
+    return 0
+  fi
+
   case "${OS_ID}" in
     almalinux)
-      dnf -y install epel-release snapd
+      dnf -y install epel-release
+      if dnf -y install certbot python3-certbot-apache; then
+        have_cmd certbot && return 0
+      fi
+      dnf -y install snapd || return 1
       systemctl enable --now snapd.socket
       ;;
     ubuntu|debian)
+      export DEBIAN_FRONTEND=noninteractive
+      if apt-get install -y certbot python3-certbot-apache; then
+        have_cmd certbot && return 0
+      fi
       systemctl enable --now snapd >/dev/null 2>&1 || true
       ;;
   esac
+
   ln -s /var/lib/snapd/snap /snap 2>/dev/null || true
-  snap install core >/dev/null 2>&1 || true
-  snap refresh core >/dev/null 2>&1 || true
-  snap install --classic certbot >/dev/null 2>&1 || true
+  snap install core || return 1
+  snap refresh core || true
+  snap install --classic certbot || return 1
   ln -sf /snap/bin/certbot /usr/local/bin/certbot
-  have_cmd certbot || die "Certbot install failed."
+  have_cmd certbot
 }
 
 certbot_preflight_checks() {
@@ -947,7 +1174,10 @@ request_ssl_if_ready() {
   fi
 
   log "Installing Certbot..."
-  install_certbot_any
+  if ! install_certbot_any; then
+    record_issue "Certbot could not be installed automatically. The site is ready over HTTP; install certbot and request SSL manually."
+    return 0
+  fi
   log "Requesting Let's Encrypt certificate..."
   if [[ "${WANT_WWW}" == "yes" && "${www_ready}" == "yes" ]]; then
     if ! certbot --apache --non-interactive --agree-tos -m "${LE_EMAIL}" $( [[ "${FORCE_HTTPS}" == "yes" ]] && echo "--redirect" ) -d "${SITE_DOMAIN}" -d "www.${SITE_DOMAIN}"; then
@@ -962,8 +1192,8 @@ request_ssl_if_ready() {
   fi
   if [[ -f "/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem" ]]; then
     log "Certificate installed successfully."
-    wp option update home "https://${SITE_DOMAIN}" --path="${WEB_ROOT}" --allow-root
-    wp option update siteurl "https://${SITE_DOMAIN}" --path="${WEB_ROOT}" --allow-root
+    "${WP_CLI}" option update home "https://${SITE_DOMAIN}" --path="${WEB_ROOT}" --allow-root
+    "${WP_CLI}" option update siteurl "https://${SITE_DOMAIN}" --path="${WEB_ROOT}" --allow-root
   else
     record_issue "Certbot ran, but expected certificate files were not found."
   fi
@@ -992,7 +1222,11 @@ print_summary() {
 
   echo
   echo -e "${GREEN}====================================================${NC}"
-  echo -e "${GREEN}Install complete. Your WordPress server is ready.${NC}"
+  if [[ "${COMMAND}" == "add-site" ]]; then
+    echo -e "${GREEN}Add-site complete. Your isolated WordPress site is ready.${NC}"
+  else
+    echo -e "${GREEN}Install complete. Your WordPress server is ready.${NC}"
+  fi
   echo -e "${GREEN}====================================================${NC}"
   echo -e "${BLUE}Server Type:${NC}             ${detected_server_type}"
   echo -e "${BLUE}PHP Version:${NC}             ${detected_php_version:-Unknown}"
@@ -1021,15 +1255,195 @@ print_summary() {
   echo -e "${GREEN}====================================================${NC}"
 }
 
+
+
+collect_add_site_answers() {
+  while true; do
+    prompt_nonempty SITE_DOMAIN "New site domain (example.com): "
+    SITE_DOMAIN="${SITE_DOMAIN,,}"
+    validate_domain "${SITE_DOMAIN}" && break
+    warn "Please enter a valid domain."
+  done
+
+  set_db_defaults_for_domain
+
+  if [[ -e "${DOCROOT_BASE}/${SITE_DOMAIN}" ]]; then
+    die "${DOCROOT_BASE}/${SITE_DOMAIN} already exists."
+  fi
+  if [[ -f "${APACHE_CONF_DIR}/${SITE_DOMAIN}.conf" ]]; then
+    die "${APACHE_CONF_DIR}/${SITE_DOMAIN}.conf already exists."
+  fi
+
+  prompt_nonempty SITE_TITLE "WordPress site title: "
+  prompt_nonempty ADMIN_USER "WordPress admin username: "
+  prompt_hidden_nonempty ADMIN_PASS "WordPress admin password: "
+
+  while true; do
+    prompt_nonempty ADMIN_EMAIL "WordPress admin email: "
+    validate_email "${ADMIN_EMAIL}" && break
+    warn "Please enter a valid email address."
+  done
+
+  prompt_nonempty_default DB_NAME "MariaDB database name:" "${DEFAULT_GENERATED_DB_NAME}"
+  prompt_nonempty_default DB_USER "MariaDB database username:" "${DEFAULT_GENERATED_DB_USER}"
+  prompt_hidden_nonempty DB_PASS "MariaDB database password: "
+
+  if [[ -n "${DEFAULT_SERVER_PUBLIC_IP:-}" ]]; then
+    prompt_ipv4_default SERVER_PUBLIC_IP "Public server IPv4 address:" "${DEFAULT_SERVER_PUBLIC_IP}"
+  else
+    prompt_ipv4 SERVER_PUBLIC_IP "Public server IPv4 address: "
+  fi
+
+  prompt_yes_no WANT_WWW "Also configure www.${SITE_DOMAIN}?"
+  prompt_yes_no WANT_SSL "Create Let's Encrypt certificate when DNS is ready?"
+  if [[ "${WANT_SSL}" == "yes" ]]; then
+    while true; do
+      if [[ -n "${DEFAULT_LE_EMAIL:-}" ]]; then
+        prompt_nonempty_default LE_EMAIL "Let's Encrypt email:" "${DEFAULT_LE_EMAIL}"
+      else
+        prompt_nonempty LE_EMAIL "Let's Encrypt email: "
+      fi
+      validate_email "${LE_EMAIL}" && break
+      warn "Please enter a valid email address."
+    done
+  fi
+  prompt_yes_no FORCE_HTTPS "Redirect HTTP to HTTPS after certificate is installed?"
+
+  WANT_CLOUDFLARE="yes"
+  INSTALL_BIND="no"
+  CONFIGURE_FIREWALL="no"
+  set_site_paths
+
+  echo
+  echo "================= ADD SITE SUMMARY ================="
+  echo "Domain:         ${SITE_DOMAIN}"
+  echo "WWW Alias:      ${WANT_WWW}"
+  echo "Web root:       ${WEB_ROOT}"
+  echo "Site user:      ${SITE_USER}"
+  echo "PHP-FPM pool:   ${PHP_FPM_POOL_NAME}"
+  echo "PHP-FPM socket: ${PHP_FPM_SOCKET}"
+  echo "Database:       ${DB_NAME}"
+  echo "Let's Encrypt:  ${WANT_SSL}"
+  echo "===================================================="
+  echo
+  echo "Create DNS records before requesting SSL:"
+  echo "  - A @ -> ${SERVER_PUBLIC_IP}"
+  if [[ "${WANT_WWW}" == "yes" ]]; then
+    echo "  - CNAME www -> ${SITE_DOMAIN}"
+    echo "    or A www -> ${SERVER_PUBLIC_IP}"
+  fi
+  echo
+
+  while true; do
+    read -r -p "Proceed with adding this isolated site? [y/n]: " GO_AHEAD
+    case "${GO_AHEAD,,}" in
+      y|yes) break ;;
+      n|no) die "Add-site cancelled." ;;
+      *) warn "Please answer y or n." ;;
+    esac
+  done
+}
+
+collect_existing_site_for_migration() {
+  while true; do
+    prompt_nonempty EXISTING_SITE_DOMAIN "Existing site domain to migrate (example.com): "
+    EXISTING_SITE_DOMAIN="${EXISTING_SITE_DOMAIN,,}"
+    validate_domain "${EXISTING_SITE_DOMAIN}" && break
+    warn "Please enter a valid domain."
+  done
+  EXISTING_SITE_ROOT="${DOCROOT_BASE}/${EXISTING_SITE_DOMAIN}"
+  EXISTING_APACHE_SITE_CONF="${APACHE_CONF_DIR}/${EXISTING_SITE_DOMAIN}.conf"
+
+  if [[ ! -d "${EXISTING_SITE_ROOT}" ]]; then
+    die "Existing site root was not found: ${EXISTING_SITE_ROOT}"
+  fi
+  if [[ ! -f "${EXISTING_APACHE_SITE_CONF}" ]]; then
+    die "Existing Apache vhost was not found: ${EXISTING_APACHE_SITE_CONF}"
+  fi
+}
+
+migrate_existing_site_to_php_fpm() {
+  local saved_domain="${SITE_DOMAIN:-}"
+  SITE_DOMAIN="${EXISTING_SITE_DOMAIN}"
+  set_site_paths
+  WEB_ROOT="${EXISTING_SITE_ROOT}"
+  SITE_ROOT="${EXISTING_SITE_ROOT}"
+  APACHE_SITE_CONF="${EXISTING_APACHE_SITE_CONF}"
+  PHP_FPM_POOL_CONF="${PHP_FPM_POOL_DIR}/${PHP_FPM_POOL_NAME}.conf"
+  PHP_FPM_SOCKET="${PHP_FPM_SOCKET_DIR}/${SITE_USER}.sock"
+
+  if site_uses_php_fpm "${APACHE_SITE_CONF}"; then
+    log "${SITE_DOMAIN} already appears to use PHP-FPM."
+    SITE_DOMAIN="${saved_domain}"
+    return 0
+  fi
+
+  configure_php_fpm_site
+  chown -R "${SITE_USER}:${SITE_GROUP}" "${SITE_ROOT}"
+  find "${SITE_ROOT}" -type d -exec chmod 755 {} \;
+  find "${SITE_ROOT}" -type f -exec chmod 644 {} \;
+  [[ -f "${WEB_ROOT}/wp-config.php" ]] && chmod 640 "${WEB_ROOT}/wp-config.php" || true
+
+  cp -a "${APACHE_SITE_CONF}" "${APACHE_SITE_CONF}.pre-fpm.$(date +%Y%m%d%H%M%S)"
+  if ! grep -q 'SetHandler "proxy:unix:' "${APACHE_SITE_CONF}"; then
+    sed -i '/<\/Directory>/a\\\n    <FilesMatch \\.php$>\\\n        SetHandler "proxy:unix:'"${PHP_FPM_SOCKET}"'|fcgi://localhost/"\\\n    </FilesMatch>' "${APACHE_SITE_CONF}"
+  fi
+  restart_apache_checked
+  SITE_DOMAIN="${saved_domain}"
+}
+
+offer_existing_site_migration() {
+  if find "${APACHE_CONF_DIR}" -maxdepth 1 -name '*.conf' -type f -exec grep -Eq 'proxy:unix:|SetHandler "proxy:' {} \; -print -quit | grep -q .; then
+    log "PHP-FPM Apache vhost mode already appears to be in use."
+    return 0
+  fi
+
+  warn "No existing Apache vhost using PHP-FPM was detected."
+  note "For better isolation, migrate the existing WordPress site before adding more sites."
+  prompt_yes_no MIGRATE_EXISTING_SITE "Migrate an existing serverwp site to isolated PHP-FPM now?"
+  [[ "${MIGRATE_EXISTING_SITE}" == "yes" ]] || return 0
+  collect_existing_site_for_migration
+  migrate_existing_site_to_php_fpm
+}
+
+add_site_main() {
+  require_root
+  detect_os
+  detect_php_fpm_runtime || true
+  show_banner
+  show_intro
+  run_step "Installing base tools..." install_base_packages
+  run_step "Checking PHP-FPM isolation mode..." offer_existing_site_migration
+  collect_add_site_answers
+  run_step "Configuring isolated PHP-FPM site user and pool..." configure_php_fpm_site
+  run_step "Configuring MariaDB database and user..." configure_mariadb
+  run_step "Checking WP-CLI..." ensure_wp_cli
+  run_step "Installing WordPress..." install_wordpress
+  run_step "Installing UpdraftPlus..." install_updraftplus
+  run_step "Setting WordPress file permissions..." set_wordpress_permissions
+  run_step "Creating Apache vhost..." configure_apache_vhost
+  if [[ "${WANT_SSL}" == "yes" ]]; then
+    run_step "Attempting Let's Encrypt setup..." request_ssl_if_ready
+  fi
+  run_step "Running final checks..." final_checks
+  print_summary
+}
+
 main() {
+  validate_command
+  if [[ "${COMMAND}" == "add-site" ]]; then
+    add_site_main
+    return
+  fi
   require_root
   detect_os
   show_banner
   show_intro
   collect_answers
   run_step "Installing base packages..." install_base_packages
-  run_step "Installing Apache and PHP..." install_apache_php
+  run_step "Installing Apache and PHP-FPM..." install_apache_php
   run_step "Applying PHP tuning..." tune_php
+  run_step "Configuring isolated PHP-FPM site user and pool..." configure_php_fpm_site
   run_step "Installing MariaDB..." install_mariadb
   run_step "Configuring MariaDB..." configure_mariadb
   run_step "Installing WP-CLI..." install_wp_cli
