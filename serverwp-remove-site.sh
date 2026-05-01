@@ -175,7 +175,7 @@ collect_answers() {
   echo
 
   local confirmation=""
-  read -r -p "Type REMOVE ${SITE_DOMAIN} to continue: " confirmation
+  read -r -p "TYPE \"REMOVE ${SITE_DOMAIN}\" TO CONTINUE: " confirmation
   [[ "${confirmation}" == "REMOVE ${SITE_DOMAIN}" ]] || die "Removal cancelled."
 }
 
