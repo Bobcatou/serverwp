@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="serverwp"
-SCRIPT_VERSION="4.1.8"
+SCRIPT_VERSION="4.1.9"
 
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

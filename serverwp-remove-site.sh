@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="serverwp-remove-site"
-SCRIPT_VERSION="4.1.8"
+SCRIPT_VERSION="4.1.9"
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'

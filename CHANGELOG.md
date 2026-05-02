@@ -2,7 +2,7 @@
 
 All notable changes to serverwp will be documented in this file.
 
-## Unreleased
+## v4.1.9
 
 - Added `add-site` mode for adding isolated WordPress sites to an existing serverwp server.
 - Added per-site PHP-FPM pool support with dedicated Linux users, sockets, and Apache vhost routing.
